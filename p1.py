@@ -4,21 +4,25 @@ import ctypes as ct
 program = r"""
 #include <linux/tracepoint.h>
 #include <linux/sched.h>
+#include <linux/mman.h>
 
-BPF_RINGBUF_OUTPUT(heap, 4096 * 64);
+BPF_RINGBUF_OUTPUT(heap, 64);
 
 struct data_struct {
     char data[256];
 };
 
 struct heap_dump {
+  long addr;
   int size;
   int doWrite;
-  char data[4096 * 64]; // PAGE_SIZE * 4
+  char data[4096 * 4]; // PAGE_SIZE * 4
 };
 
 //BPF_ARRAY(hd, struct heap_dump, 1);
-BPF_TABLE_PINNED("array", int, struct heap_dump, hd, 1, "/sys/fs/bpf/my_counter_map");
+BPF_TABLE_PINNED("array", int, struct heap_dump, hd, 10, "/sys/fs/bpf/my_counter_map");
+
+static unsigned int last_idx = 0;
 
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     char filename[30];
@@ -42,91 +46,80 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
         ((char *)t + offsetof(struct task_struct, mm))
         );
 
-        //get heap (brk start, brk)
-        long unsigned int start_brk, brk;
-        bpf_probe_read_kernel(&start_brk,
-        sizeof(start_brk),
-        ((char *)mm + offsetof(struct mm_struct, start_brk))
-        );
-        bpf_probe_read_kernel(&brk,
-        sizeof(brk),
-        ((char *)mm + offsetof(struct mm_struct, brk))
-        );
-        bpf_trace_printk("heap starts at %lx and ends at %lx\n", start_brk, brk);
+        if(!mm)
+            return 0;
 
-        //save heap
-        int tile = 4096*4;
-        int range = 0xFFF; // (brk - start_brk - 127500) & 0x3FFFF; // & 1048576;
-        //heap.ringbuf_output(&data, sizeof(data), 0);
-        bpf_trace_printk("range: %d\n", range);
-
-        int idx = 0;
-        struct heap_dump *ptr = hd.lookup(&idx);
-        if(ptr == NULL)
-            return -1;
-        ptr->size = range;
-        ptr->doWrite = 0;
-        int i = 0, flag = 0;
-        //for(; i<range; i += tile)
-        {
-            //bpf_trace_printk("reading from %d\n", sizeof(data.data));
-            int out = bpf_probe_read(
-            ptr->data,
-            range,
-            (void *)(start_brk + i)
+        struct vm_area_struct *vma;
+            bpf_probe_read_kernel(&vma,
+            sizeof(vma),
+            ((char *)mm + offsetof(struct mm_struct, mmap))
             );
-            heap.ringbuf_output(ptr, sizeof(*ptr), 0);
-            bpf_trace_printk("read err: %d\n", out);
-            /*if(out != 0) {
-                if(!flag) {
-                bpf_trace_printk("read err: %d\n", out);
-                flag = 1;
-                }
+
+        bpf_trace_printk("Process ID: %d\\n", pid);
+        long unsigned int vma_start, vma_end, vma_flags;
+        int c = 9999, range; //satisfy ebpf verifier
+        while (vma && c>0) {
+            c--;
+
+            bpf_probe_read_kernel(&vma_start,
+            sizeof(vma_start),
+            ((char *)vma + offsetof(struct vm_area_struct, vm_start))
+            );
+            bpf_probe_read_kernel(&vma_end,
+            sizeof(vma_end),
+            ((char *)vma + offsetof(struct vm_area_struct, vm_end))
+            );
+            bpf_probe_read_kernel(&vma_flags,
+            sizeof(vma_flags),
+            ((char *)vma + offsetof(struct vm_area_struct, vm_flags))
+            );
+
+            // check if range is valid and vma is writable
+            range = vma_end - vma_start;
+            if(range > 0 && (vma_flags & PROT_WRITE)) {
+                int idx = last_idx;
+                if(idx > 999)
+                    return -1;
+                struct heap_dump *ptr = hd.lookup(&idx);
+                if(ptr == NULL)
+                    return -1;
+                ptr->size = range;
+                ptr->doWrite = 0;
+                int err = bpf_probe_read(
+                ptr->data,
+                range,
+                (void *)(vma_start)
+                );
+                bpf_trace_printk("read err code: %d", err);
+
+                if(err>=0)
+                    last_idx++;
+                bpf_trace_printk("VMA Start: %lx, VMA End: %lx\\n", vma_start, vma_end);
             }
-            else if(flag)
-                bpf_trace_printk("found valid data after some error: %d\n", out);
-            */
-            //bpf_trace_printk("data: %s\n", data.data);
-            //if(out < 0)
-            //    break;
+
+            // go to next vma
+            bpf_probe_read_kernel(&vma,
+            sizeof(vma),
+            ((char *)vma + offsetof(struct vm_area_struct, vm_next))
+            );
+
         }
+
     }
     else {
         char target_path2[] = "/tmp/ready_to_restore";
-        if (__builtin_strcmp(target_path2, filename) == 0)
+        /*if (__builtin_strcmp(target_path2, filename) == 0)
         {
             bpf_trace_printk("openat called with file: %s \n", filename);
-            //get tid
-            //get page table
-            struct task_struct *t = (struct task_struct *)bpf_get_current_task();
 
-            //get mm_struct
-            struct mm_struct* mm = 0;
-            bpf_probe_read_kernel(
-            &mm,
-            sizeof(mm),
-            ((char *)t + offsetof(struct task_struct, mm))
-            );
-
-            //get heap (brk start, brk)
-            long unsigned int start_brk, brk;
-            bpf_probe_read_kernel(&start_brk,
-            sizeof(start_brk),
-            ((char *)mm + offsetof(struct mm_struct, start_brk))
-            );
-            bpf_probe_read_kernel(&brk,
-            sizeof(brk),
-            ((char *)mm + offsetof(struct mm_struct, brk))
-            );
-            bpf_trace_printk("heap starts at %lx and ends at %lx\n", start_brk, brk);
-
-            //write heap
-            int range = (brk - start_brk - 127500) & 0x3FFFF; // & 1048576;
-            bpf_trace_printk("range: %d\n", range);
+            //write vma
             int idx = 0;
-            struct heap_dump *ptr = hd.lookup(&idx);
-            if(ptr == NULL)
-                return -1;
+            for(; idx < last_idx && idx < 999; ++idx) {
+                struct heap_dump *ptr = hd.lookup(&idx);
+                if(ptr == NULL)
+                    return -1;
+
+            bpf_trace_printk("range: %d\n", range);
             ptr->size = range;
             ptr->doWrite = 1;
             int out = bpf_probe_write_user(
@@ -138,12 +131,13 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             bpf_trace_printk("write err: %d\n", out);
 
         }
+        */
     }
     return 0;
 }
 """
 
-b = BPF(text=program, debug=0)  # 6
+b = BPF(text=program, debug=6)
 b.attach_tracepoint(
     "syscalls:sys_enter_openat", "tracepoint__syscalls__sys_enter_openat"
 )
