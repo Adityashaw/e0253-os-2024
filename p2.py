@@ -75,9 +75,6 @@ __always_inline static int write_from_buff(const unsigned int *idx)
     }
 }
 
-__always_inline static void clean_map() {
-
-}
 
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     char filename[30];
@@ -146,23 +143,16 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             ((char *)vma + offsetof(struct vm_area_struct, vm_next))
             );
 
-            bpf_trace_printk("VMA Start: %lx", vma_start);
             // check if range is valid and vma is anon
             range = vma_end - vma_start;
             if(vma_start < start_brk) {
-                bpf_trace_printk("%lx below brk %lx", vma_start, start_brk);
                 continue;
             }
             if(vma_end > start_stack) {
-                bpf_trace_printk("above base");
                 continue;
             }
-            /*if(vma_file)
-                continue;
-            */
             if((vma_flags & MAP_ANONYMOUS))
             {
-                bpf_trace_printk("anon");
                 if(idx > 99)
                     break;
                 struct heap_dump *ptr = hd.lookup(&idx);
@@ -172,39 +162,25 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
                 ptr->doWrite = 0;
                 unsigned long size = ((range > 0) ? range : 0) & 0xFFFF;
                 ptr->size = size;
-                bpf_trace_printk("VMA Start: %lx, VMA End: %lx", vma_start, vma_end);
-                bpf_trace_printk("Actual Size: %lu New Size: %lu", range, size);
                 int i=0, err_flag = 0;
                 unsigned int tile = 0xFFFF;
-                //for(; i+tile<size; i+=tile) {
-                    //unsigned i_size = i+tile > size ? size - i : tile;
-                    int err = bpf_probe_read(
-                    ptr->data + i,
-                    size,
-                    (void *)((char *)(vma_start) + i)
-                    );
-                    bpf_trace_printk("read err code: %d", err);
-                    if(err<0)
-                    {
-                        err_flag = 1;
-                        continue;
-                    }
-                    else
-                    {
-                        ptr->doWrite = 1;
-                    }
+                int err = bpf_probe_read(
+                ptr->data + i,
+                size,
+                (void *)((char *)(vma_start) + i)
+                );
+                if(err<0)
+                {
+                    err_flag = 1;
+                    continue;
+                }
+                else
+                {
+                    ptr->doWrite = 1;
+                }
 
-                //}
-                //if(i < size) {
-
-                //}
-                    
                 if(!err_flag)
                     idx +=1;
-            }
-            else
-            {
-                bpf_trace_printk("not anon");
             }
 
         }
@@ -222,7 +198,6 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             //write vma
 
             // Iterate over the pinned array map
-            //bpf_map_for_each_elem(&hd, ptr)
             int idx = 0;
             write_from_buff(&idx); 
             int c = 99;
@@ -230,24 +205,7 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             write_from_buff(&idx);
             idx++;
             c = c - 1;
-            }/*
-            idx = 2;
-            write_from_buff(&idx); 
-            idx = 3;
-            write_from_buff(&idx); 
-            idx = 4;
-            write_from_buff(&idx); 
-            idx = 5;
-            write_from_buff(&idx); 
-            idx = 6;
-            write_from_buff(&idx); 
-            idx = 7;
-            write_from_buff(&idx); 
-            idx = 8;
-            write_from_buff(&idx); 
-            idx = 9;
-            write_from_buff(&idx); 
-*/
+            }
             struct task_alert ta = {1};
             rb.ringbuf_output(&ta, sizeof(ta), 0);
         }
@@ -263,15 +221,6 @@ b.attach_tracepoint(
 )
 
 
-class HeapDump(ct.Structure):
-    _fields_ = [
-        ("addr", ct.c_long),
-        ("size", ct.c_int),
-        ("doWrite", ct.c_int),
-        ("data", ct.c_byte * (4096)),
-    ]
-
-
 def save_data_to_file(data, filename):
     with open(filename, "wb") as f:
         f.write(data)
@@ -280,52 +229,25 @@ def save_data_to_file(data, filename):
 def delete_file(file_path):
     try:
         os.remove(file_path)
-        print(f"File {file_path} deleted successfully.")
     except OSError as e:
-        print(f"Error deleting file {file_path}: {e.strerror}")
+        pass
 
 
 def read_data_from_file(filename):
     with open(filename, "rb") as f:
         return f.read()
 
-def process_data2(cpu, data, size):
+def process_data(cpu, data, size):
     event = b["rb"].event(data)
     # Process the event data here
-    print("Received event:", event.read_or_write)
     if event.read_or_write:
         save_data_to_file(b"", "/tmp/restore_complete")
     else:
         save_data_to_file(b"", "/tmp/checkpoint_complete")
 
 
-def process_data(cpu, data, size):
-    # event = b["heap"].event(data)
-    event = ct.cast(data, ct.POINTER(HeapDump)).contents
-    data_size = event.size
-    data = bytes(event.data)[:data_size]
-    # Process the event data here
-    print("Received event:", len(data), data_size)
-    if event.doWrite:
-        file_path = "/tmp/ready_to_restore"
-        delete_file(file_path)
-        save_data_to_file(b"", "/tmp/restore_complete")
-    else:
-        file_path = "/tmp/ready_to_checkpoint"
-        delete_file(file_path)
-        save_data_to_file(data, "data.bin")
-        save_data_to_file(b"", "/tmp/checkpoint_complete")
-
-        # Read data back from the file
-        data_read = read_data_from_file("data.bin")
-
-        # Verify if the data is the same
-        print(data == data_read)
-
-
 # Attach the Python function to the ring buffer
-b["rb"].open_ring_buffer(process_data2)
-# b.trace_print()
+b["rb"].open_ring_buffer(process_data)
 while 1:
     try:
         b.ring_buffer_poll(30)
