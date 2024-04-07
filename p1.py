@@ -16,7 +16,7 @@ struct heap_dump {
   long addr;
   int size;
   int doWrite;
-  char data[4096 * 4]; // PAGE_SIZE * 4
+  char data[4096 * 64]; // PAGE_SIZE * 4
 };
 
 //BPF_ARRAY(hd, struct heap_dump, 1);

@@ -129,8 +129,9 @@ int run_testcase3()
 {
         int *buff,ret;
 
-        buff =  mmap((void *)0x7ff7ca71e000, sizeof(int) * num_elements, PROT_READ | PROT_WRITE ,MAP_ANON| MAP_SHARED, -1, 0);
-        if (buff == MAP_FAILED){
+        buff =  mmap((void *)0x7ff7ca71e000, sizeof(int) * num_elements, PROT_READ | PROT_WRITE ,MAP_ANONYMOUS| MAP_SHARED, -1, 0);
+        printf("\n%lx\n", buff);
+	if (buff == MAP_FAILED){
                printf("failed mmap\n");
                return 0;
         }
