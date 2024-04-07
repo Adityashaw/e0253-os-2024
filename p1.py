@@ -6,34 +6,87 @@ program = r"""
 #include <linux/sched.h>
 #include <linux/mman.h>
 
-BPF_RINGBUF_OUTPUT(heap, 64);
 
-struct data_struct {
-    char data[256];
-};
+BPF_RINGBUF_OUTPUT(rb, 4096*64);
 
 struct heap_dump {
-  long addr;
-  int size;
+  unsigned long addr;
+  unsigned int size;
   int doWrite;
-  char data[4096 * 64]; // PAGE_SIZE * 4
+  char data[4096 * 16]; // PAGE_SIZE * 4
 };
 
-//BPF_ARRAY(hd, struct heap_dump, 1);
-BPF_TABLE_PINNED("array", int, struct heap_dump, hd, 10, "/sys/fs/bpf/my_counter_map");
+struct task_alert {
+    int read_or_write; // 0 => read done,  1 => write done
+};
+
+#define ARRAY_LEN 1000
+BPF_ARRAY(hd, struct heap_dump, ARRAY_LEN);
 
 static unsigned int last_idx = 0;
+
+__always_inline static int string_check(char s1[30], char s2[30]) {
+    int len = 30;
+    int i = 0;
+    if(!s1 || !s2)
+        return 1;
+    char a, b;
+    for(; i<len; ++i) {
+        a = *(s1+i);
+        b = *(s2+i);
+        if(!a && !b)
+            return 0;
+        //if(!a)
+        //    return 1;
+        //|| !b)
+        //    return 1;
+        if(a != b)
+            return 1;
+    }
+    return 0;
+
+}
+
+__always_inline static int write_from_buff(int *idx)
+{
+    if(*idx < 0)
+        return 1;
+    if(*idx > ARRAY_LEN-1)
+        return 1;
+    struct heap_dump *ptr = hd.lookup(idx);
+    if(!ptr)
+        return 1;
+
+    unsigned long size = ((ptr->size > 0) ? ptr->size : 0) & 0xFFFF;
+    unsigned long addr = ((ptr->addr>0) ? ptr->addr : 0) & 0xFFFFFFFFFFFFFFFF;
+
+    int doWrite = ptr->doWrite;
+    if(!doWrite)
+        return 1;
+    ptr->doWrite = 0;
+    if(addr >0) {
+    if(size > 1) {
+        //bpf_trace_printk("addr %lx, size: %d\n", addr, size);
+        int out = bpf_probe_write_user(
+        (void *)(addr),
+        ptr->data,
+        size
+        );
+        //bpf_trace_printk("write err: %d\n", out);
+    }
+    }
+    return 0;
+}
+
 
 TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
     char filename[30];
     bpf_probe_read(filename, sizeof(filename), args->filename);
 
-    char target_path[] = "/tmp/ready_to_checkpoint";
-    if (__builtin_strcmp(target_path, filename) == 0)
+    char target_path[30] = "/tmp/ready_to_checkpoint";
+    if (string_check(target_path, filename) == 0)
     {
         bpf_trace_printk("openat called with file: %s \n", filename);
-        //get tid
-        u32 pid = bpf_get_current_pid_tgid();
 
         //get page table
         struct task_struct *t = (struct task_struct *)bpf_get_current_task();
@@ -50,14 +103,24 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             return 0;
 
         struct vm_area_struct *vma;
+		long unsigned int start_stack, start_brk;
             bpf_probe_read_kernel(&vma,
             sizeof(vma),
             ((char *)mm + offsetof(struct mm_struct, mmap))
             );
+            bpf_probe_read_kernel(&start_stack,
+            sizeof(start_stack),
+            ((char *)mm + offsetof(struct mm_struct, start_stack))
+            );
+            bpf_probe_read_kernel(&start_brk,
+            sizeof(start_brk),
+            ((char *)mm + offsetof(struct mm_struct, start_brk))
+            );
 
-        bpf_trace_printk("Process ID: %d\\n", pid);
         long unsigned int vma_start, vma_end, vma_flags;
-        int c = 9999, range; //satisfy ebpf verifier
+	    struct file *vma_file;
+        int c = 20; unsigned long range; //satisfy ebpf verifier
+        int idx = 0;
         while (vma && c>0) {
             c--;
 
@@ -73,66 +136,100 @@ TRACEPOINT_PROBE(syscalls, sys_enter_openat) {
             sizeof(vma_flags),
             ((char *)vma + offsetof(struct vm_area_struct, vm_flags))
             );
-
-            // check if range is valid and vma is writable
-            range = vma_end - vma_start;
-            if(range > 0 && (vma_flags & PROT_WRITE)) {
-                int idx = last_idx;
-                if(idx > 999)
-                    return -1;
-                struct heap_dump *ptr = hd.lookup(&idx);
-                if(ptr == NULL)
-                    return -1;
-                ptr->size = range;
-                ptr->doWrite = 0;
-                int err = bpf_probe_read(
-                ptr->data,
-                range,
-                (void *)(vma_start)
-                );
-                bpf_trace_printk("read err code: %d", err);
-
-                if(err>=0)
-                    last_idx++;
-                bpf_trace_printk("VMA Start: %lx, VMA End: %lx\\n", vma_start, vma_end);
-            }
-
+            bpf_probe_read_kernel(&vma_file,
+            sizeof(vma_file),
+            ((char *)vma + offsetof(struct vm_area_struct, vm_file))
+            );
             // go to next vma
             bpf_probe_read_kernel(&vma,
             sizeof(vma),
             ((char *)vma + offsetof(struct vm_area_struct, vm_next))
             );
 
+            // check if range is valid and vma is anon
+            range = vma_end - vma_start;
+            if(vma_start < start_brk) {
+                continue;
+            }
+            if(vma_end > start_stack) {
+                continue;
+            }
+            if((vma_flags & MAP_ANONYMOUS))
+            {
+                if(idx > ARRAY_LEN-1)
+                    break;
+                //bpf_trace_printk("VMA Start: %lx, VMA End: %lx", vma_start, vma_end);
+                int chunks = 400;
+                unsigned long size = ((range > 0) ? range : 0) & 0xFFFFFFFF;
+                unsigned long temp_size = size;
+                unsigned long temp_addr = vma_start;
+                unsigned long tile = 0x1000;
+                //bpf_trace_printk("size: %lu, range %lu\n", temp_size, range);
+                //bpf_trace_printk("chunks: %d, &range %lu\n", chunks, range & 0xFFFFFFFF);
+                while(chunks > 0 && temp_size > 0)
+                {
+                    chunks--;
+                    struct heap_dump *ptr = hd.lookup(&idx);
+                    if(ptr == NULL) {
+                        bpf_trace_printk("Error fetching array element");
+                        continue;
+                    }
+                    ptr->addr = temp_addr;
+                    ptr->doWrite = 0;
+                    int err_flag = 0;
+                    int err = 0;
+                    //bpf_trace_printk("Read from: %lx, till: %lx", temp_addr, temp_addr + tile);
+                    ptr->size = tile;
+                    err = bpf_probe_read(
+                        ptr->data,
+                        tile,
+                        (void *)((char *)(temp_addr))
+                    );
+                    temp_addr = temp_addr + tile;
+                    temp_size = temp_size - tile;
+                    bpf_trace_printk("idx %d read err: %d\n", idx, err);
+                    if(err<0)
+                    {
+                        err_flag = 1;
+                        continue;
+                    }
+                    else
+                    {
+                        ptr->doWrite = 1;
+                    }
+
+                    if(!err_flag)
+                        idx +=1;
+                }
+            }
+
         }
+        last_idx = idx;
+        struct task_alert ta = {0};
+        rb.ringbuf_output(&ta, sizeof(ta), 0);
 
     }
     else {
-        char target_path2[] = "/tmp/ready_to_restore";
-        /*if (__builtin_strcmp(target_path2, filename) == 0)
+        char target_path2[30] = "/tmp/ready_to_restore";
+        if (string_check(target_path2, filename) == 0)
         {
             bpf_trace_printk("openat called with file: %s \n", filename);
-
             //write vma
+
+            // Iterate over the pinned array map
             int idx = 0;
-            for(; idx < last_idx && idx < 999; ++idx) {
-                struct heap_dump *ptr = hd.lookup(&idx);
-                if(ptr == NULL)
-                    return -1;
-
-            bpf_trace_printk("range: %d\n", range);
-            ptr->size = range;
-            ptr->doWrite = 1;
-            int out = bpf_probe_write_user(
-            (void *)(start_brk),
-            ptr->data,
-            0xFFF
-            );
-            heap.ringbuf_output(ptr, sizeof(*ptr), 0);
-            bpf_trace_printk("write err: %d\n", out);
-
+            write_from_buff(&idx); 
+            int c = ARRAY_LEN-1;
+            while(c>0) {
+            write_from_buff(&idx);
+            idx++;
+            c = c - 1;
+            }
+            struct task_alert ta = {1};
+            rb.ringbuf_output(&ta, sizeof(ta), 0);
         }
-        */
     }
+
     return 0;
 }
 """
@@ -143,47 +240,33 @@ b.attach_tracepoint(
 )
 
 
-class HeapDump(ct.Structure):
-    _fields_ = [
-        ("size", ct.c_int),
-        ("doWrite", ct.c_int),
-        ("data", ct.c_byte * (4096 * 64)),
-    ]
-
-
 def save_data_to_file(data, filename):
     with open(filename, "wb") as f:
         f.write(data)
+
+
+def delete_file(file_path):
+    try:
+        os.remove(file_path)
+    except OSError as e:
+        pass
 
 
 def read_data_from_file(filename):
     with open(filename, "rb") as f:
         return f.read()
 
-
 def process_data(cpu, data, size):
-    # event = b["heap"].event(data)
-    event = ct.cast(data, ct.POINTER(HeapDump)).contents
-    data_size = event.size
-    data = bytes(event.data)[:data_size]
+    event = b["rb"].event(data)
     # Process the event data here
-    print("Received event:", len(data), data_size)
-    if event.doWrite:
+    if event.read_or_write:
         save_data_to_file(b"", "/tmp/restore_complete")
     else:
-        save_data_to_file(data, "data.bin")
         save_data_to_file(b"", "/tmp/checkpoint_complete")
-
-        # Read data back from the file
-        data_read = read_data_from_file("data.bin")
-
-        # Verify if the data is the same
-        print(data == data_read)
 
 
 # Attach the Python function to the ring buffer
-b["heap"].open_ring_buffer(process_data)
-# b.trace_print()
+b["rb"].open_ring_buffer(process_data)
 while 1:
     try:
         b.ring_buffer_poll(30)
